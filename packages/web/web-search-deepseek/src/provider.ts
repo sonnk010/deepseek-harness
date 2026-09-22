@@ -1,7 +1,8 @@
 /**
- * DeepSeek search through an Anthropic-compatible Messages model call with the native
- * `web_search_20250305` server tool. Each search costs a model turn, but returns structured
- * result blocks; absence of those blocks is an error rather than a prose-scraping fallback.
+ * Search through the configured endpoint. DeepSeek uses an Anthropic-compatible Messages model
+ * call with the native `web_search_20250305` server tool; OpenRouter (detected by base URL) uses
+ * its Chat Completions web plugin. Each search costs a model turn, but returns structured result
+ * blocks; absence of those blocks is an error rather than a prose-scraping fallback.
  * The wire format and native `fetch` client are provider-private and do not use `ctx.llm`.
  * @module @deepseek-ai/dsh-web-search-deepseek/provider
  */
@@ -19,6 +20,8 @@ import type {
   AnthropicError,
   AnthropicResponse,
   ContentBlock,
+  OpenRouterChatCompletion,
+  OpenRouterUrlCitationAnnotation,
   TextBlock,
   WebSearchToolResultBlock,
 } from './types.ts'
@@ -48,32 +51,42 @@ export const DEEPSEEK_DEFAULT_MAX_USES = 5
 /** Attribution header sent on every request. Bump with the package version. */
 const USER_AGENT = 'deepseek-harness/0.0.1'
 
+/** One user message text block sent on both protocols. */
+type SearchUserMessage = {
+  readonly role: 'user'
+  readonly content: readonly [{ readonly type: 'text'; readonly text: string }]
+}
+
 /**
- * Exact secret-free DeepSeek Messages request recorded immediately before one
+ * Exact secret-free search request recorded immediately before one
  * auxiliary search dispatch.
  */
 export interface DeepSeekSearchLlmRequest {
-  /** Fully resolved Messages endpoint. */
+  /** Fully resolved search endpoint. */
   readonly endpoint: string
-  /** `anthropic-version` header value. */
+  /** `anthropic-version` header value (DeepSeek path only). */
   readonly apiVersion: string
-  /** Exact JSON body sent to the provider. */
-  readonly body: {
-    readonly model: string
-    readonly max_tokens: number
-    readonly messages: readonly [{
-      readonly role: 'user'
-      readonly content: readonly [{
-        readonly type: 'text'
-        readonly text: string
-      }]
-    }]
-    readonly tools: readonly [{
-      readonly type: 'web_search_20250305'
-      readonly name: 'web_search'
-      readonly max_uses: number
-    }]
-  }
+  /** Exact JSON body sent to the provider: Anthropic Messages or OpenRouter web-plugin. */
+  readonly body:
+    | {
+        readonly model: string
+        readonly max_tokens: number
+        readonly messages: readonly [SearchUserMessage]
+        readonly tools: readonly [{
+          readonly type: 'web_search_20250305'
+          readonly name: 'web_search'
+          readonly max_uses: number
+        }]
+      }
+    | {
+        readonly model: string
+        readonly max_tokens: number
+        readonly messages: readonly [SearchUserMessage]
+        readonly plugins: readonly [{
+          readonly id: 'web'
+          readonly max_results: number
+        }]
+      }
 }
 
 declare module '@deepseek-ai/dsh-session/types' {
@@ -91,9 +104,12 @@ export interface DeepSeekSearchProviderOptions {
   resolveApiKey?: () => Promise<string | undefined>
   /** Credential reference named by missing-credential diagnostics. */
   apiKeyEnv?: CredentialRef
-  /** Endpoint base; `/messages` is appended. */
+  /**
+   * Endpoint base. DeepSeek's Anthropic-compatible base gets `/messages` appended;
+   * an OpenRouter base must already name the Chat Completions endpoint.
+   */
   baseURL: string
-  /** Anthropic-format model name. */
+  /** Model name sent to the search endpoint (Anthropic-format on DeepSeek, OpenRouter id otherwise). */
   model: string
   /** `anthropic-version` header value. */
   apiVersion: string
@@ -173,8 +189,52 @@ export function mapAnthropicResponse(response: AnthropicResponse): WebSearchResu
 }
 
 /**
- * The DeepSeek-backed search provider. HTTP redirects fail as `WEB_PROVIDER_ERROR`;
- * failures after dispatch name the endpoint and tell the model how the user can configure it.
+ * Map an OpenRouter Chat Completions response (web plugin `plugins:[{id:'web'}]`) to a normalized
+ * search result. The model prose arrives in `choices[0].message.content`; sources arrive as
+ * `url_citation` annotations carrying `url`, `title`, and a `content` excerpt used as the snippet.
+ * OpenRouter does not implement the Anthropic `web_search_20250305` server tool, so this mapping
+ * is the OpenRouter-path output. The web service owns the final `maxResults` truncation, so
+ * `truncated` is always `false` here.
+ *
+ * @param response - the parsed Chat Completions response body.
+ * @returns the normalized result with deduped, snippet-joined sources and the answer.
+ * @throws {@link WebError} when the response carried no usable source.
+ */
+export function mapOpenRouterResponse(response: OpenRouterChatCompletion): WebSearchResult {
+  const message = response.choices?.[0]?.message
+  const answer = typeof message?.content === 'string' ? message.content : ''
+  const seen = new Set<string>()
+  const sources: WebSearchSource[] = []
+  const cited = (message?.annotations ?? []).filter(
+    (annotation): annotation is OpenRouterUrlCitationAnnotation => annotation.type === 'url_citation',
+  )
+  for (const annotation of cited) {
+    const cite = annotation.url_citation
+    if (cite.url.length === 0 || seen.has(cite.url)) continue
+    seen.add(cite.url)
+    sources.push({
+      url: cite.url,
+      ...cite.title != null && cite.title.length > 0 ? { title: cite.title } : {},
+      ...cite.content != null && cite.content.length > 0 ? { snippet: cite.content } : {},
+    })
+  }
+  if (sources.length === 0) {
+    const detail = answer.length > 0
+      ? answer.slice(0, 200)
+      : 'no sources and no answer in the response'
+    throw new WebError(`OpenRouter web search returned no usable sources (${detail})`, 'WEB_PROVIDER_ERROR')
+  }
+  return {
+    sources,
+    truncated: false,
+    ...answer.length > 0 ? { answer } : {},
+  }
+}
+
+/**
+ * The search provider backing `web_search`, serving the configured base URL. HTTP redirects
+ * fail as `WEB_PROVIDER_ERROR`; failures after dispatch name the endpoint and tell the model
+ * how the user can configure it.
  */
 export class DeepSeekSearchProvider implements WebSearchProvider {
   readonly id = DEEPSEEK_PROVIDER_ID
@@ -203,8 +263,17 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
     const options = this.resolveOptions()
     const apiKey = await this.apiKey(options, signal)
     throwIfSearchAborted(signal)
-    const endpoint = `${options.baseURL}/messages`
-    const body: DeepSeekSearchLlmRequest['body'] = {
+    const openRouter = isOpenRouterBase(options.baseURL)
+    const endpoint = openRouter ? options.baseURL : `${options.baseURL}/messages`
+    const body: DeepSeekSearchLlmRequest['body'] = openRouter ? {
+      model: options.model,
+      max_tokens: options.maxTokens,
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: `Perform a web search for the query: ${request.query}` }],
+      }],
+      plugins: [{ id: 'web', max_results: Math.min(options.maxUses, 5) }],
+    } : {
       model: options.model,
       max_tokens: options.maxTokens,
       messages: [{
@@ -224,7 +293,12 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
       response = await fetch(endpoint, {
         method: 'POST',
         redirect: 'error',
-        headers: {
+        headers: openRouter ? {
+          'authorization': `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+          'accept': 'application/json',
+          'user-agent': USER_AGENT,
+        } : {
           // Official DeepSeek expects `x-api-key`; an Anthropic-compatible proxy
           // may expect `Authorization: Bearer` — send both so either resolves.
           'x-api-key': apiKey,
@@ -241,14 +315,14 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
       if (signal?.aborted === true || isAbortError(error)) throw searchAborted(signal, error)
       throw searchEndpointError(
         endpoint,
-        `DeepSeek search request failed: ${String(error)}`,
+        `${openRouter ? 'OpenRouter' : 'DeepSeek'} web search request failed: ${String(error)}`,
         error,
       )
     }
 
     if (!response.ok) {
       const status = response.status
-      let message = `DeepSeek API error (HTTP ${status})`
+      let message = `${openRouter ? 'OpenRouter' : 'DeepSeek'} API error (HTTP ${status})`
       try {
         const parsed = await response.json() as AnthropicError
         const detail = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message ?? parsed.message
@@ -266,13 +340,15 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
     }
 
     try {
-      const payload = await response.json() as AnthropicResponse
-      return mapAnthropicResponse(payload)
+      const payload = await response.json() as AnthropicResponse | OpenRouterChatCompletion
+      return openRouter
+        ? mapOpenRouterResponse(payload as OpenRouterChatCompletion)
+        : mapAnthropicResponse(payload as AnthropicResponse)
     } catch (error: unknown) {
       if (signal?.aborted === true || isAbortError(error)) throw searchAborted(signal, error)
       const message = error instanceof WebError
         ? error.message
-        : `DeepSeek returned an unprocessable response body: ${String(error)}`
+        : `${openRouter ? 'OpenRouter' : 'DeepSeek'} returned an unprocessable response body: ${String(error)}`
       throw searchEndpointError(endpoint, message, error)
     }
   }
@@ -366,4 +442,9 @@ function isAbortError(error: unknown): boolean {
 /** True for DeepSeek request limits that can be sent to the Messages API. */
 function isPositiveInteger(value: number): boolean {
   return Number.isInteger(value) && value > 0
+}
+
+/** True when the configured base URL targets OpenRouter's Chat Completions API. */
+function isOpenRouterBase(baseURL: string): boolean {
+  return /openrouter\.ai/i.test(baseURL)
 }
