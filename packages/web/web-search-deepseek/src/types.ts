@@ -47,3 +47,37 @@ export interface AnthropicError {
   error?: { message?: string } | string
   message?: string
 }
+
+/** One `url_citation` annotation payload inside an OpenRouter assistant message. */
+export interface OpenRouterUrlCitation {
+  url: string
+  title?: string | null
+  /** Excerpt of the cited page; mapped to the search source snippet. */
+  content?: string | null
+}
+
+/** An `url_citation` entry inside `message.annotations[]`. */
+export interface OpenRouterUrlCitationAnnotation {
+  type: 'url_citation'
+  url_citation: OpenRouterUrlCitation
+}
+
+/** Any annotation; only `url_citation` is consumed, unknown types are skipped. */
+export type OpenRouterAnnotation = OpenRouterUrlCitationAnnotation | { type: string }
+
+/** An OpenRouter Chat Completions assistant message (web plugin response). */
+export interface OpenRouterMessage {
+  content: string | null
+  annotations?: OpenRouterAnnotation[]
+}
+
+/** One Chat Completions choice; only the first is consumed. */
+export interface OpenRouterChoice {
+  message?: OpenRouterMessage | null
+}
+
+/** OpenRouter Chat Completions response envelope for the web plugin. */
+export interface OpenRouterChatCompletion {
+  choices?: OpenRouterChoice[]
+  error?: { message?: string } | string
+}
