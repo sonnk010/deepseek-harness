@@ -12,8 +12,8 @@ import {
   DEEPSEEK_PROVIDER_ID,
 } from '@deepseek-ai/dsh-web-search-deepseek'
 import * as deepseekPlugin from '@deepseek-ai/dsh-web-search-deepseek'
-import { citationSnippets, mapAnthropicResponse } from '../src/provider.ts'
-import type { AnthropicResponse } from '@deepseek-ai/dsh-web-search-deepseek/src/types.ts'
+import { citationSnippets, mapAnthropicResponse, mapOpenRouterResponse } from '../src/provider.ts'
+import type { AnthropicResponse, OpenRouterChatCompletion } from '@deepseek-ai/dsh-web-search-deepseek/src/types.ts'
 
 /** Construct the provider over a fixed options value; production passes a live thunk. */
 import type { DeepSeekSearchProviderOptions } from '@deepseek-ai/dsh-web-search-deepseek'
@@ -157,6 +157,84 @@ describe('mapAnthropicResponse', () => {
   })
 })
 
+describe('mapOpenRouterResponse', () => {
+  /** An OpenRouter web-plugin response with two url_citation annotations. */
+  const openRouterResponse = (): OpenRouterChatCompletion => ({
+    choices: [{
+      message: {
+        content: 'Here is what I found.',
+        annotations: [
+          { type: 'url_citation', url_citation: { url: 'https://a.test', title: 'A', content: 'excerpt for A' } },
+          { type: 'url_citation', url_citation: { url: 'https://b.test', title: 'B', content: '' } },
+        ],
+      },
+    }],
+  })
+
+  it('maps url_citation annotations to sources and keeps the answer', () => {
+    expect(mapOpenRouterResponse(openRouterResponse())).toEqual({
+      sources: [
+        { url: 'https://a.test', title: 'A', snippet: 'excerpt for A' },
+        { url: 'https://b.test', title: 'B' },
+      ],
+      truncated: false,
+      answer: 'Here is what I found.',
+    })
+  })
+
+  it('dedupes repeated urls across annotations (first wins)', () => {
+    const result = mapOpenRouterResponse({
+      choices: [{
+        message: {
+          content: 'a',
+          annotations: [
+            { type: 'url_citation', url_citation: { url: 'https://a.test', title: 'first' } },
+            { type: 'url_citation', url_citation: { url: 'https://a.test', title: 'second' } },
+          ],
+        },
+      }],
+    })
+    expect(result.sources).toEqual([{ url: 'https://a.test', title: 'first' }])
+  })
+
+  it('skips non-url_citation annotations and empty urls', () => {
+    const result = mapOpenRouterResponse({
+      choices: [{
+        message: {
+          content: '',
+          annotations: [
+            { type: 'web_search', url_citation: { url: 'https://skip.test' } },
+            { type: 'url_citation', url_citation: { url: '' } },
+            { type: 'url_citation', url_citation: { url: 'https://ok.test', title: 'OK' } },
+          ],
+        },
+      }],
+    })
+    expect(result.sources).toEqual([{ url: 'https://ok.test', title: 'OK' }])
+  })
+
+  it('omits the answer when content is absent or empty', () => {
+    const result = mapOpenRouterResponse({
+      choices: [{
+        message: {
+          content: '',
+          annotations: [{ type: 'url_citation', url_citation: { url: 'https://a.test', title: 'A' } }],
+        },
+      }],
+    })
+    expect(result).toEqual({ sources: [{ url: 'https://a.test', title: 'A' }], truncated: false })
+  })
+
+  it('throws WEB_PROVIDER_ERROR when no usable source is present', () => {
+    expect(() => mapOpenRouterResponse({ choices: [{ message: { content: 'just prose' } }] }))
+      .toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+  })
+
+  it('throws WEB_PROVIDER_ERROR when choices or message are absent', () => {
+    expect(() => mapOpenRouterResponse({})).toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
+  })
+})
+
 describe('DeepSeekSearchProvider availability', () => {
   it('is unavailable without a key', () => {
     expect(searchProvider({ ...options, apiKey: '' }).available()).toBe(false)
@@ -213,6 +291,48 @@ describe('DeepSeekSearchProvider request mapping', () => {
     await searchProvider(options).search({ query: 'q' }, controller.signal)
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(init.signal).toBe(controller.signal)
+  })
+})
+
+describe('DeepSeekSearchProvider OpenRouter request mapping', () => {
+  const openRouterChatCompletion = (): OpenRouterChatCompletion => ({
+    choices: [{
+      message: {
+        content: 'found it',
+        annotations: [{ type: 'url_citation', url_citation: { url: 'https://a.test', title: 'A' } }],
+      },
+    }],
+  })
+
+  it('posts the web-plugin body to the base URL as-is with bearer auth and caps max_results', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(openRouterChatCompletion()))
+    const recordRequest = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const openRouterOptions = {
+      ...options,
+      baseURL: 'https://openrouter.ai/api/v1/chat/completions',
+      maxUses: 9,
+    }
+    await searchProvider({ ...openRouterOptions, recordRequest }).search({ query: 'hello' })
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://openrouter.ai/api/v1/chat/completions')
+    expect(init).toMatchObject({ method: 'POST', redirect: 'error' })
+    const headers = init.headers as Record<string, string>
+    expect(headers['authorization']).toBe('Bearer ds-key')
+    expect(headers['x-api-key']).toBeUndefined()
+    expect(headers['anthropic-version']).toBeUndefined()
+    const body = {
+      model: 'deepseek-chat',
+      max_tokens: 4096,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Perform a web search for the query: hello' }] }],
+      plugins: [{ id: 'web', max_results: 5 }],
+    }
+    expect(JSON.parse(init.body as string)).toEqual(body)
+    expect(recordRequest).toHaveBeenCalledWith({
+      endpoint: url,
+      apiVersion: '2023-06-01',
+      body,
+    })
   })
 })
 
